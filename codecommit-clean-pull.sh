@@ -23,7 +23,10 @@
 #     aws CLI / git-remote-codecommit が必要です。
 #
 # 依存: bash, git （grc remote の場合は aws, git-remote-codecommit）
-# 共通部品: common.sh （log_info / log_warn / log_error / log_debug / die / require_cmd / confirm）
+# 共通部品: common.sh （log_info / log_success / log_warn / log_error / die / run /
+#           confirm / require_command）
+#   - log_info / log_success は stdout、log_warn / log_error は stderr に出力します。
+#   - common.sh には log_debug が無いため、本スクリプトでローカルに定義します（DEBUG=true で有効）。
 #
 set -Eeuo pipefail
 
@@ -32,8 +35,6 @@ set -Eeuo pipefail
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT_NAME="$(basename "${BASH_SOURCE[0]}")"
-COMMON_LOG_PREFIX="${SCRIPT_NAME}"   # common.sh のログプレフィックスに使われる
-export COMMON_LOG_PREFIX
 
 if [[ ! -f "${SCRIPT_DIR}/common.sh" ]]; then
   echo "[${SCRIPT_NAME}][ERROR] common.sh が見つかりません: ${SCRIPT_DIR}/common.sh" >&2
@@ -41,6 +42,13 @@ if [[ ! -f "${SCRIPT_DIR}/common.sh" ]]; then
 fi
 # shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
+
+# common.sh には log_debug が無いため、DEBUG=true のときだけ stderr に出力する
+# デバッグログヘルパをローカル定義する（色は common.sh の定義を流用）。
+log_debug() {
+  [[ "${DEBUG:-false}" == "true" ]] || return 0
+  printf '%s[DEBUG]%s %s\n' "${C_YELLOW}" "${C_RESET}" "$*" >&2
+}
 
 # ---------------------------------------------------------------------------
 # 1. 既定値
@@ -54,7 +62,7 @@ KEEP_IGNORED="false"        # true の場合 .gitignore 無視ファイルは残
 SYNC_SUBMODULES="true"      # true の場合 submodule も再帰的に同期・クリーン
 DRY_RUN="false"             # true の場合は破壊的操作を行わず、何が起きるかだけ表示
 ASSUME_YES="false"          # true の場合は対話確認をスキップ
-DEBUG="${DEBUG:-false}"     # true の場合 log_debug を有効化（common.sh が参照）
+DEBUG="${DEBUG:-false}"     # true の場合 log_debug を有効化（上で定義したローカル関数が参照）
 export DEBUG
 
 # ---------------------------------------------------------------------------
@@ -157,7 +165,8 @@ git_r() {
 # 6. 前提確認 / リポジトリ確認
 # ---------------------------------------------------------------------------
 preflight() {
-  require_cmd git "RHEL なら: sudo dnf install -y git"
+  # git が無ければ即終了（RHEL なら: sudo dnf install -y git）
+  require_command git
 
   # AWS リージョン指定があれば export（grc remote / aws CLI 用）
   if [[ -n "${REGION}" ]]; then
@@ -200,8 +209,10 @@ preflight() {
 
   # grc(git-remote-codecommit)形式の remote なら依存コマンドを確認
   if [[ "${remote_url}" == codecommit::* ]]; then
-    require_cmd aws "AWS CLI v2 が必要です: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html"
-    require_cmd git-remote-codecommit "pip install git-remote-codecommit が必要です。"
+    # aws CLI v2: https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html
+    require_command aws
+    # git-remote-codecommit: pip install git-remote-codecommit
+    require_command git-remote-codecommit
     log_debug "grc 形式の remote を検出しました（aws / git-remote-codecommit 確認済み）。"
   fi
 }

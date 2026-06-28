@@ -1,119 +1,101 @@
 #!/usr/bin/env bash
 #
-# common.sh
-# =========
-# 複数のシェルスクリプトから source して使う「共通部品」です。
-# 主にロギング・前提コマンド確認・対話確認などの汎用ヘルパを提供します。
+# common.sh - 複数のスクリプトで共有するユーティリティ関数群
 #
-# 使い方（呼び出し側スクリプト）:
-#   SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-#   # shellcheck source=common.sh
-#   source "${SCRIPT_DIR}/common.sh"
+# 使い方:
+#   このファイルを source して各関数を利用する。
+#     source "$(dirname "$0")/common.sh"
 #
-# このファイルが提供する公開インターフェース（呼び出し側が依存してよい関数）:
-#   log_info   <msg...>          : 情報ログ（stderr, 緑）
-#   log_warn   <msg...>          : 警告ログ（stderr, 黄）
-#   log_error  <msg...>          : エラーログ（stderr, 赤）
-#   log_debug  <msg...>          : デバッグログ（DEBUG=true のときだけ stderr に出力）
-#   die        <msg...>          : エラーを出して exit 1
-#   require_cmd <name> [hint]    : コマンドが PATH に無ければ die
-#   confirm    <prompt>          : y/N の対話確認（yes なら 0、no なら 1 を返す）
+#   DRY_RUN=true を設定すると run() は実コマンドを実行せず表示のみ行う。
 #
-# 環境変数:
-#   DEBUG=true            : log_debug を有効化
-#   NO_COLOR=1            : 色付けを無効化（出力先が非 TTY の場合も自動で無効）
-#   COMMON_LOG_PREFIX     : ログ行の先頭に付けるプレフィックス（既定: 呼び出し元スクリプト名）
-#
-# 注意:
-#   - すべてのログは stderr に出力します（stdout はスクリプト本来の出力専用にするため）。
-#   - 認証情報など秘匿値は絶対にログに出さないでください（このファイルでは出しません）。
-#
+# 注意: このファイル自体は単体実行を想定していない（source 専用）。
 
-# 二重 source による再定義を避けるためのガード
-if [[ -n "${__COMMON_SH_LOADED:-}" ]]; then
+# 既に読み込み済みなら何もしない（多重 source 対策）
+#   注意: マーカー変数が環境に漏れていても、関数が未定義の新しいシェルでは
+#   必ず定義し直すよう「変数あり かつ 関数定義済み」を読み込み済みの条件とする。
+if [[ -n "${COMMON_SH_LOADED:-}" ]] && declare -F require_command >/dev/null 2>&1; then
   return 0 2>/dev/null || exit 0
 fi
-__COMMON_SH_LOADED=1
-COMMON_SH_VERSION="1.0.0"
+COMMON_SH_LOADED=1
 
 # ---------------------------------------------------------------------------
-# 色設定
-#   - 出力先(stderr)が端末でない、または NO_COLOR が設定されている場合は無効化
+# 色定義（端末が対応している場合のみ色を付ける）
 # ---------------------------------------------------------------------------
-if [[ -t 2 && -z "${NO_COLOR:-}" ]]; then
-  __C_RESET="$(printf '\033[0m')"
-  __C_RED="$(printf '\033[31m')"
-  __C_GREEN="$(printf '\033[32m')"
-  __C_YELLOW="$(printf '\033[33m')"
-  __C_GRAY="$(printf '\033[90m')"
+if [[ -t 1 ]]; then
+  C_RESET="$(printf '\033[0m')"
+  C_RED="$(printf '\033[31m')"
+  C_GREEN="$(printf '\033[32m')"
+  C_YELLOW="$(printf '\033[33m')"
+  C_BLUE="$(printf '\033[34m')"
 else
-  __C_RESET=""; __C_RED=""; __C_GREEN=""; __C_YELLOW=""; __C_GRAY=""
+  C_RESET="" C_RED="" C_GREEN="" C_YELLOW="" C_BLUE=""
 fi
 
-# ログ行の先頭プレフィックス（既定は呼び出し元スクリプト名）
-__log_prefix() {
-  local p="${COMMON_LOG_PREFIX:-$(basename "${0}")}"
-  printf '[%s]' "${p}"
-}
-
 # ---------------------------------------------------------------------------
-# ロギング関数（すべて stderr）
+# ログ関数
 # ---------------------------------------------------------------------------
-log_info() {
-  printf '%s %sINFO%s  %s\n' "$(__log_prefix)" "${__C_GREEN}" "${__C_RESET}" "$*" >&2
-}
+log_info()    { printf '%s[INFO]%s  %s\n'  "$C_BLUE"   "$C_RESET" "$*"; }
+log_success() { printf '%s[OK]%s    %s\n'  "$C_GREEN"  "$C_RESET" "$*"; }
+log_warn()    { printf '%s[WARN]%s  %s\n'  "$C_YELLOW" "$C_RESET" "$*" >&2; }
+log_error()   { printf '%s[ERROR]%s %s\n'  "$C_RED"    "$C_RESET" "$*" >&2; }
 
-log_warn() {
-  printf '%s %sWARN%s  %s\n' "$(__log_prefix)" "${__C_YELLOW}" "${__C_RESET}" "$*" >&2
-}
-
-log_error() {
-  printf '%s %sERROR%s %s\n' "$(__log_prefix)" "${__C_RED}" "${__C_RESET}" "$*" >&2
-}
-
-log_debug() {
-  if [[ "${DEBUG:-false}" == "true" ]]; then
-    printf '%s %sDEBUG%s %s\n' "$(__log_prefix)" "${__C_GRAY}" "${__C_RESET}" "$*" >&2
-  fi
-}
-
-# エラーを出して終了
+# エラーメッセージを出して終了する
+# usage: die "メッセージ" [終了コード]
 die() {
-  log_error "$*"
-  exit 1
+  local msg="$1"
+  local code="${2:-1}"
+  log_error "$msg"
+  exit "$code"
 }
 
 # ---------------------------------------------------------------------------
-# 前提コマンドの存在確認
-#   require_cmd git "git をインストールしてください"
+# コマンド実行ヘルパー
+#   DRY_RUN=true のときは実行内容を表示するだけで実行しない。
+#   それ以外のときは表示してから実行する。
+#
+# usage: run git push origin --delete feature/foo
 # ---------------------------------------------------------------------------
-require_cmd() {
-  local cmd="${1:?require_cmd: コマンド名が必要です}"
-  local hint="${2:-}"
-  if ! command -v "${cmd}" >/dev/null 2>&1; then
-    if [[ -n "${hint}" ]]; then
-      die "必要なコマンドが見つかりません: ${cmd} （${hint}）"
-    else
-      die "必要なコマンドが見つかりません: ${cmd}"
-    fi
+run() {
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    printf '%s[DRY-RUN]%s %s\n' "$C_YELLOW" "$C_RESET" "$*"
+    return 0
   fi
+  printf '%s[RUN]%s %s\n' "$C_BLUE" "$C_RESET" "$*"
+  "$@"
 }
 
 # ---------------------------------------------------------------------------
-# 対話確認（y/N）
-#   confirm "本当に実行しますか?" && do_something
-#   - 非 TTY の場合は false を返す（呼び出し側で --yes 等を別途用意すること）
+# 確認プロンプト
+#   ASSUME_YES=true（--yes 相当）のときは確認せず yes とみなす。
+#   DRY_RUN=true のときも確認をスキップする（破壊的操作は実行されないため）。
+#
+# usage: if confirm "本当に削除しますか?"; then ... ; fi
+# 戻り値: yes -> 0, no -> 1
 # ---------------------------------------------------------------------------
 confirm() {
   local prompt="${1:-続行しますか?}"
-  if [[ ! -t 0 ]]; then
-    return 1
+
+  if [[ "${ASSUME_YES:-false}" == "true" ]]; then
+    return 0
   fi
-  local ans=""
-  printf '%s %s [y/N]: ' "$(__log_prefix)" "${prompt}" >&2
-  read -r ans || true
-  case "${ans}" in
-    y|Y|yes|YES) return 0 ;;
-    *)           return 1 ;;
+  if [[ "${DRY_RUN:-false}" == "true" ]]; then
+    log_info "(dry-run のため確認をスキップ)"
+    return 0
+  fi
+
+  local reply
+  read -r -p "$prompt [y/N]: " reply
+  case "$reply" in
+    [yY] | [yY][eE][sS]) return 0 ;;
+    *) return 1 ;;
   esac
+}
+
+# ---------------------------------------------------------------------------
+# 必須コマンドの存在確認
+# usage: require_command git
+# ---------------------------------------------------------------------------
+require_command() {
+  local cmd="$1"
+  command -v "$cmd" >/dev/null 2>&1 || die "コマンドが見つかりません: $cmd"
 }
