@@ -65,6 +65,18 @@ ASSUME_YES="false"          # true の場合は対話確認をスキップ
 DEBUG="${DEBUG:-false}"     # true の場合 log_debug を有効化（上で定義したローカル関数が参照）
 export DEBUG
 
+# --- AWS 認証 / CodeCommit 権限まわりの設定 -------------------------------
+SKIP_AWS_CHECK="false"      # true の場合 AWS 認証 / CodeCommit 権限チェックを行わない
+AUTO_SWITCH_ROLE="false"    # true の場合 CodeCommit 権限が無いときに自動でスイッチロールする
+                            #   false の場合は警告メッセージを出して終了する
+SWITCH_ROLE_SCRIPT=""       # スイッチロール用シェル（別チーム提供）のパス。
+                            #   --auto-switch-role 指定時、または手動案内に使用する。
+                            #   source で呼び出して現在のシェルに認証情報を反映する。
+
+# preflight で確定する内部状態（remote URL と CodeCommit 判定）
+REMOTE_URL=""
+IS_CODECOMMIT="false"
+
 # ---------------------------------------------------------------------------
 # 2. 使い方
 # ---------------------------------------------------------------------------
@@ -93,6 +105,22 @@ usage() {
   --debug                 デバッグログを出力する
   -h, --help              このヘルプを表示
 
+AWS 認証 / CodeCommit 権限関連:
+  本スクリプトは実行開始時に、CodeCommit リモートに対しては以下を確認します。
+    (1) AWS に認証済みか（aws sts get-caller-identity）
+        未認証なら 'aws login --remote' を促して終了します。
+    (2) 現在の IAM 権限で CodeCommit から git pull できるか（codecommit:GitPull）
+        ※管理 API 権限ではなく、実際の取得経路(git ls-remote)で判定します。
+        権限が無い場合の挙動は以下のオプションで切り替えます。
+
+  --switch-role-script <path>
+                          スイッチロール用シェル（別チーム提供）のパス。
+                          --auto-switch-role 時は source で呼び出してスイッチロールします。
+                          省略時は手動でスイッチロールするよう案内します。
+  --auto-switch-role      CodeCommit 権限が無い場合、終了せずに上記シェルを source して
+                          自動的にスイッチロールします (既定: 警告して終了)。
+  --skip-aws-check        AWS 認証 / CodeCommit 権限チェックを一切行わない。
+
 例:
   # ドライラン（何が消えるか・何が変わるかを確認）
   ./${SCRIPT_NAME} --repo-dir /opt/app/my-repo --dry-run
@@ -103,6 +131,10 @@ usage() {
   # リポジトリ名・リージョンを検証しつつ実行
   ./${SCRIPT_NAME} --repo-dir /opt/app/my-repo --repo-name my-repo \\
     --region ap-northeast-1 --yes
+
+  # CodeCommit 権限が無ければ自動でスイッチロールして実行
+  ./${SCRIPT_NAME} --repo-dir /opt/app/my-repo --yes \\
+    --auto-switch-role --switch-role-script /opt/team/switch-role.sh
 
 終了コード:
   0  成功（リモートと完全一致）
@@ -126,6 +158,9 @@ parse_args() {
       --no-submodules) SYNC_SUBMODULES="false"; shift 1 ;;
       --dry-run)       DRY_RUN="true"; shift 1 ;;
       -y|--yes)        ASSUME_YES="true"; shift 1 ;;
+      --switch-role-script) SWITCH_ROLE_SCRIPT="${2:-}"; shift 2 ;;
+      --auto-switch-role)   AUTO_SWITCH_ROLE="true"; shift 1 ;;
+      --skip-aws-check)     SKIP_AWS_CHECK="true"; shift 1 ;;
       --debug)         DEBUG="true"; export DEBUG; shift 1 ;;
       -h|--help)       usage; exit 0 ;;
       *)               usage; die "不明なオプションです: ${1}" ;;
@@ -197,7 +232,17 @@ preflight() {
   fi
   local remote_url
   remote_url="$(git_r remote get-url "${REMOTE}")"
+  REMOTE_URL="${remote_url}"
   log_info "リモート ${REMOTE}: ${remote_url}"
+
+  # CodeCommit のリモートかどうかを判定する。
+  #   - grc 形式 : codecommit::<region>://<repo>
+  #   - HTTPS 形式: https://git-codecommit.<region>.amazonaws.com/v1/repos/<repo>
+  #   - SSH 形式  : ssh://git-codecommit.<region>.amazonaws.com/v1/repos/<repo>
+  if [[ "${remote_url}" == codecommit::* || "${remote_url}" == *git-codecommit.* ]]; then
+    IS_CODECOMMIT="true"
+    log_debug "CodeCommit のリモートを検出しました。"
+  fi
 
   # 指定された CodeCommit リポジトリ名が remote URL に含まれるか検証（任意）
   if [[ -n "${REPO_NAME}" ]]; then
@@ -215,6 +260,122 @@ preflight() {
     require_command git-remote-codecommit
     log_debug "grc 形式の remote を検出しました（aws / git-remote-codecommit 確認済み）。"
   fi
+}
+
+# ---------------------------------------------------------------------------
+# 6.5 AWS 認証 / CodeCommit 権限の事前チェック
+# ---------------------------------------------------------------------------
+
+# AWS に認証済みかどうかを確認する。
+#   - aws sts get-caller-identity が成功すれば認証済み。
+#   - 失敗（資格情報が無い / 失効）した場合は 'aws login --remote' を促して終了する。
+check_aws_auth() {
+  require_command aws
+
+  log_info "AWS の認証状態を確認します (aws sts get-caller-identity)..."
+  local caller
+  if ! caller="$(aws sts get-caller-identity --query Arn --output text 2>/dev/null)"; then
+    log_error "AWS の認証情報が見つからない、または失効しています（未認証状態です）。"
+    log_error "先に以下のコマンドで認証してから、本スクリプトを再実行してください:"
+    log_error "    aws login --remote"
+    die "未認証のため中止しました。"
+  fi
+  log_info "認証済み IAM プリンシパル: ${caller}"
+}
+
+# 現在の IAM 権限で CodeCommit から git pull できるかを確認する。
+#   本スクリプトが実際に必要とするのは管理 API 権限ではなく、git 通信に使う
+#   codecommit:GitPull 権限である。GitPull は AWS CLI に対応コマンドが無いため、
+#   実際の取得経路と同じ git ls-remote を試して判定する。
+#     - 成功                       => GitPull 権限あり (0)
+#     - 認可エラー(403/AccessDenied 等) => GitPull 権限なし (1)
+#     - それ以外のエラー(ネットワーク等) => 権限の問題ではないとみなし権限ありとして扱う
+#       （後続の fetch で別途エラーとして検出される）。
+#   GIT_TERMINAL_PROMPT=0 で資格情報の対話入力待ち（ハング）を防ぐ。
+codecommit_access_ok() {
+  local out rc
+  out="$(GIT_TERMINAL_PROMPT=0 git_r ls-remote --heads "${REMOTE}" 2>&1)"; rc=$?
+
+  if [[ ${rc} -eq 0 ]]; then
+    return 0
+  fi
+
+  log_debug "GitPull 権限チェック (git ls-remote) の出力 (rc=${rc}): ${out}"
+  if printf '%s' "${out}" \
+       | grep -Eiq 'AccessDenied|not authorized|UnauthorizedOperation|\b403\b|Forbidden|Authentication failed|permission|denied'; then
+    return 1
+  fi
+
+  log_warn "GitPull 権限チェックで認可エラー以外のエラーを検出しました（権限ありとして続行します）:"
+  log_warn "  ${out}"
+  return 0
+}
+
+# 別チーム提供のスイッチロール用シェルを source して、現在のシェルに認証情報を反映する。
+do_switch_role() {
+  [[ -n "${SWITCH_ROLE_SCRIPT}" ]] \
+    || die "自動スイッチロールには --switch-role-script <path> の指定が必要です。"
+  [[ -f "${SWITCH_ROLE_SCRIPT}" ]] \
+    || die "スイッチロール用シェルが見つかりません: ${SWITCH_ROLE_SCRIPT}"
+
+  log_info "スイッチロール用シェルを source します: ${SWITCH_ROLE_SCRIPT}"
+  # 別チーム提供のシェルを source し、AWS 認証情報（環境変数など）を現在のシェルへ反映する。
+  # shellcheck disable=SC1090
+  source "${SWITCH_ROLE_SCRIPT}" \
+    || die "スイッチロール用シェルの実行に失敗しました: ${SWITCH_ROLE_SCRIPT}"
+}
+
+# CodeCommit の GitPull 権限を確認し、権限が無い場合はオプションに応じて
+#   --auto-switch-role 指定時 : スイッチロールを自動実行して再確認
+#   未指定時                  : スイッチロールを促して終了
+check_codecommit_permission() {
+  log_info "現在の IAM 権限で CodeCommit から git pull（codecommit:GitPull）できるか確認します..."
+  if codecommit_access_ok; then
+    log_info "CodeCommit の GitPull 権限を確認しました。"
+    return 0
+  fi
+
+  log_warn "現在の IAM 権限では CodeCommit の GitPull が許可されていません。"
+
+  if [[ "${AUTO_SWITCH_ROLE}" == "true" ]]; then
+    log_info "自動スイッチロールを実行します (--auto-switch-role)。"
+    do_switch_role
+    if codecommit_access_ok; then
+      log_info "スイッチロール後、CodeCommit の GitPull 権限を確認しました。"
+      return 0
+    fi
+    die "スイッチロールを実行しましたが、CodeCommit の GitPull 権限を取得できませんでした。ロール設定を確認してください。"
+  fi
+
+  # 自動スイッチロール無効時: 案内を出して終了する。
+  log_error "CodeCommit から git pull するにはスイッチロールが必要です。以下のいずれかを実施してください:"
+  if [[ -n "${SWITCH_ROLE_SCRIPT}" ]]; then
+    log_error "  1) スイッチロール用シェルを source してから再実行する:"
+    log_error "       source ${SWITCH_ROLE_SCRIPT}"
+  else
+    log_error "  1) 別チーム提供のスイッチロール用シェルを source してから再実行する:"
+    log_error "       source <スイッチロール用シェルのパス>"
+  fi
+  log_error "  2) 本スクリプトに自動スイッチロールを任せる:"
+  log_error "       --auto-switch-role --switch-role-script <スイッチロール用シェルのパス>"
+  die "CodeCommit の GitPull 権限が無いため中止しました。"
+}
+
+# AWS 認証 / CodeCommit 権限チェックのエントリポイント。
+#   - --skip-aws-check 指定時はスキップ。
+#   - CodeCommit 以外のリモートの場合もスキップ（チェック対象外のため）。
+aws_preflight() {
+  if [[ "${SKIP_AWS_CHECK}" == "true" ]]; then
+    log_debug "AWS 認証 / CodeCommit 権限チェックはスキップされました (--skip-aws-check)。"
+    return 0
+  fi
+  if [[ "${IS_CODECOMMIT}" != "true" ]]; then
+    log_debug "CodeCommit 以外のリモートのため、AWS 認証 / 権限チェックをスキップします。"
+    return 0
+  fi
+
+  check_aws_auth
+  check_codecommit_permission
 }
 
 # ---------------------------------------------------------------------------
@@ -402,6 +563,7 @@ main() {
   parse_args "$@"
   validate_inputs
   preflight
+  aws_preflight
   fetch_remote
 
   # ドライランはここで終了（show_dry_run 内で exit）
