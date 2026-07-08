@@ -380,10 +380,19 @@ aws_preflight() {
 
 # ---------------------------------------------------------------------------
 # 7. リモート最新の取得
+#    - --prune       : リモートで削除された追跡ブランチを掃除する
+#    - --prune-tags  : リモートで削除されたタグをローカルからも掃除する（要 --prune）
+#    - --tags        : すべてのタグを取得する
+#    - --force       : ローカルタグ/追跡refをリモートの内容で強制上書きする
+#      本スクリプトの目的は「リモートを新規 clone した直後の状態」に完全同期する
+#      ことなので、リモートで付け替えられたタグはローカル側を上書きして合わせる。
+#      --force を付けないと、リモートでタグが移動/再作成された場合に
+#        ! [rejected] <tag> -> <tag> (would clobber existing tag)
+#      となり fetch が非0終了して、ネットワーク/認証と無関係に失敗してしまう。
 # ---------------------------------------------------------------------------
 fetch_remote() {
-  log_info "リモートから fetch します（${REMOTE}, --prune --tags）..."
-  if ! git_r fetch --prune --tags "${REMOTE}"; then
+  log_info "リモートから fetch します（${REMOTE}, --prune --prune-tags --tags --force）..."
+  if ! git_r fetch --prune --prune-tags --tags --force "${REMOTE}"; then
     die "fetch に失敗しました。ネットワーク / 認証（git-remote-codecommit, IAM 権限 codecommit:GitPull 等）を確認してください。"
   fi
 
