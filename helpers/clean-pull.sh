@@ -173,16 +173,29 @@ to_abs() {
 # 4. 引数パース
 # ---------------------------------------------------------------------------
 REPO_DIR="${DEFAULT_REPO_DIR}"
+REPO_DIR_SET_BY_ARG="false"   # -r または位置引数でリポジトリを指定したか（重複指定検出用）
 BRANCH="${DEFAULT_BRANCH}"
 DRY_RUN="false"
 ASSUME_YES="false"
 DEBUG_FLAG="false"
 EXTRA_ARGS=()
 
+# リポジトリディレクトリを引数から受け取る共通処理。
+# -r と位置引数の双方から呼び出し、二重指定を確実に検出する。
+# （既定値 DEFAULT_REPO_DIR と偶然一致しても検出漏れが起きないよう、
+#   値の比較ではなく「引数で指定済みか」のフラグで判定する。）
+set_repo_dir_from_arg() {
+  if [[ "${REPO_DIR_SET_BY_ARG}" == "true" ]]; then
+    usage; err "リポジトリディレクトリが複数指定されています: '${REPO_DIR}' と '${1}'"; exit 1
+  fi
+  REPO_DIR="${1}"
+  REPO_DIR_SET_BY_ARG="true"
+}
+
 while [[ $# -gt 0 ]]; do
   case "${1}" in
     -r)           [[ -n "${2:-}" ]] || { usage; err "-r には値が必要です。"; exit 1; }
-                  REPO_DIR="${2}"; shift 2 ;;
+                  set_repo_dir_from_arg "${2}"; shift 2 ;;
     -b)           [[ -n "${2:-}" ]] || { usage; err "-b には値が必要です。"; exit 1; }
                   BRANCH="${2}"; shift 2 ;;
     -n|--dry-run) DRY_RUN="true"; shift 1 ;;
@@ -191,10 +204,7 @@ while [[ $# -gt 0 ]]; do
     -h|--help)    usage; exit 0 ;;
     --)           shift; EXTRA_ARGS=("$@"); break ;;
     -*)           usage; err "不明なオプションです: ${1}（本体のオプションは -- 以降に指定してください）"; exit 1 ;;
-    *)            if [[ -n "${REPO_DIR}" && "${REPO_DIR}" != "${DEFAULT_REPO_DIR}" ]]; then
-                    usage; err "リポジトリディレクトリが複数指定されています: '${REPO_DIR}' と '${1}'"; exit 1
-                  fi
-                  REPO_DIR="${1}"; shift 1 ;;
+    *)            set_repo_dir_from_arg "${1}"; shift 1 ;;
   esac
 done
 
